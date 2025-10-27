@@ -1,1 +1,1 @@
-"# nclcdb-market-analysis" 
+# nclcdb-market-analysis
