@@ -349,3 +349,204 @@ curl -s -X POST https://api.nclcdbaas.com/v1/tables/customers/records \
 * **Docs/SDKs**: OpenAPI-driven, consistent error model, examples included.
 
 If you want, I can turn this into a **machine-readable OpenAPI 3.1 draft** you can drop into a docs viewer and start generating SDKs from.
+
+================================================
+
+let’s zoom in on **api.nclcdbaas.com** only. here’s a crisp, build-ready blueprint of the software bricks + how the API works end-to-end (no fluff, just what you need to ship).
+
+# stack (only for the api)
+
+## edge & ingress
+
+* **cloudflare** (DNS, TLS, WAF, basic edge rate-limit)
+* **envoy or nginx** as API gateway/proxy (HTTP/2, gzip, HSTS, timeouts/retries, request/response size caps)
+
+## application service
+
+* **language/runtime:** TypeScript **Fastify** (lean, fast)
+  *(alt: NestJS if you prefer opinions; Go/Fiber if you want max throughput)*
+* **validation & typing:** **Zod** (schemas) + **OpenAPI 3.1** (single source of truth; generate clients & docs)
+* **authN/Z middleware:** custom verifier using control-plane token lookup (hash), scopes, and base_id
+* **rate limiting & idempotency:** **Redis** (Upstash/ElastiCache)
+
+  * sliding-window limiter `{token}:{route}`
+  * `X-Idempotency-Key` store for 24h with cached response
+* **job/asynch:** **BullMQ** (Redis) for non-blocking tasks (metering logs, CSV import/export prep)
+* **observability:** **OpenTelemetry** (traces/metrics) + **Sentry** (errors) + JSON logs
+
+## data access
+
+* **postgres** (managed: Neon/RDS) with **PgBouncer**
+* **connection router:** small in-memory/Redis cache that maps `{token_id → base_id, dsn}` from control plane
+* **SQL client:** `pg` or `pgtyped` (TS). No ORM for the hot path.
+* **RLS:** off by default (tenant isolation is base-level). enable per table later if needed.
+
+## security & secrets
+
+* **token storage:** hashed (argon2/bcrypt) in control plane; API receives opaque bearer; verifies against hash via cached lookup
+* **secrets:** AWS Secrets Manager / Doppler / Vault for DSNs, signing keys
+* **headers:** strict CORS (allow `app.nclcdbaas.com`), CSP on error pages, HSTS
+* **limits:** max JSON body (e.g., 1–5 MB), max batch size (e.g., 1k records), per-request row cap
+
+## docs & sdks
+
+* **OpenAPI JSON** auto-generated (fastify-zod/openapi)
+* **Redoc** or Swagger UI served at `www` docs
+* **SDKs** auto-generated (TS, Python) from OpenAPI
+
+---
+
+# request lifecycle (what happens on every call)
+
+1. **edge** (cloudflare) → basic rate-limit, TLS, WAF
+2. **gateway** (envoy/nginx) → timeouts, gzip, request size cap
+3. **api app** middleware:
+
+   * parse `Authorization: Bearer …`
+   * (optionally) require `X-Base-Id`
+   * **lookup token** (LRU/Redis cache → control plane) → get `{token_id, tenant_id, base_id, scopes}`
+   * scope check (read/write/delete)
+   * rate-limit in Redis (sliding window)
+   * if POST/PATCH with `X-Idempotency-Key`, check idem store
+4. **connection routing**: resolve **DSN for base** (cache), pull PgBouncer pool for that base
+5. **query layer**:
+
+   * validate table identifier (UUID or system name) against **runtime_meta** of that base
+   * build SQL safely from validated fields/operators (whitelist ops)
+   * execute → stream results
+6. **metering**: enqueue lightweight metric (api_calls) to queue (don’t block)
+7. **response**: include `request_id`, pagination cursors, rate-limit headers
+
+---
+
+# api surface (v1 recap)
+
+base url: `https://api.nclcdbaas.com/v1`
+
+**records (collection)**
+
+* `GET /tables/{tableId}/records` — list with filters/sorts/cursor
+* `POST /tables/{tableId}/records` — create (server generates UUID if missing)
+* `DELETE /tables/{tableId}/records` — bulk delete by `ids[]` or guarded filter (requires header)
+
+**record (single)**
+
+* `GET /tables/{tableId}/records/{id}`
+* `PATCH /tables/{tableId}/records/{id}`
+* `DELETE /tables/{tableId}/records/{id}`
+
+**batch**
+
+* `POST /tables/{tableId}/records:batchUpsert?unique=<field>`
+* `POST /tables/{tableId}/records:batchDelete`
+
+**files**
+
+* `POST /files:signUpload` → pre-signed URL for S3/GCS
+  (upload direct, then write attachment metadata into record)
+
+**import/export (async)**
+
+* `POST /tables/{tableId}/import:csv` (pre-signed upload → job)
+* `GET /tables/{tableId}/export:csv?filter=…` (returns job; download via signed URL when ready)
+
+**meta (read-only convenience)**
+
+* `GET /meta/tables` (list tables with ids & fields)
+* `GET /meta/tables/{tableId}` (fields, types, uniques)
+  *(still no DDL; true source of schema is control plane)*
+
+---
+
+# querying model
+
+**pagination (cursor)**
+
+* request: `?limit=100&cursor=opaque`
+* response: `{ data: [...], next_cursor, has_more }`
+
+**filters (whitelisted ops)**
+
+* `filter[name][eq]=Acme`
+* `filter[amount][gt]=100`
+* `filter[status][in]=open,closed`
+* `filter[created_at][between]=2025-01-01,2025-01-31`
+
+**sort**
+
+* `?sort=created_at.desc,name.asc`
+
+**projection**
+
+* `?fields=id,name,email`
+
+---
+
+# error model
+
+HTTP codes: **400, 401, 403, 404, 409, 413, 422, 429, 500**
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Field 'email' must be a valid email.",
+    "details": {"field":"email"}
+  },
+  "request_id": "req_01HF…"
+}
+```
+
+common codes: `INVALID_TOKEN`, `INSUFFICIENT_SCOPE`, `TABLE_NOT_FOUND`, `RATE_LIMITED`, `IDEMPOTENCY_REPLAYED`, `PAYLOAD_TOO_LARGE`.
+
+---
+
+# performance & safety defaults
+
+* **SLOs**: p95 read < 200ms; write < 350ms
+* **limits**: `limit ≤ 1000`, `batchUpsert ≤ 1000 items`, `payload ≤ 1–5 MB`
+* **timeouts**: gateway 30s, app 25s, DB 22s
+* **retries**: gateway retries idempotent 502/503/504 (×2, jitter)
+* **sql safety**: no string concatenation; all filters compiled to parameterized SQL
+* **escaping**: table/column identifiers validated against runtime_meta; never pass client identifiers to SQL unchecked
+* **CORS**: allow only `app.nclcdbaas.com` (and registered custom domains later)
+
+---
+
+# local dev & minimal prod
+
+**local**
+
+* docker compose: `api` (Fastify), `postgres` (base db), `redis`, `pgbouncer`
+* seed: one base with `runtime_meta` + one data table
+
+**prod (mvp)**
+
+* cloudflare → envoy
+* api on **ECS Fargate** or **Fly.io/Render**
+* postgres (Neon/RDS) + PgBouncer
+* redis (Upstash/ElastiCache)
+* object storage (S3/R2)
+
+---
+
+# testing
+
+* **contract tests** from OpenAPI (Dredd/Prism)
+* **e2e CRUD** with a seeded base (Playwright or k6 for load)
+* **security**: ZAP baseline scan in CI, fuzz filters, table name spoof tests
+* **isolation**: test that a token for base A cannot reach base B (router & SQL layer)
+
+---
+
+# what we are *not* doing (by design)
+
+* no DDL endpoints (no create table/field via public API)
+* no billing/credits endpoints
+* no cross-base queries
+* no arbitrary SQL execution
+
+---
+
+if you want next, I can turn this into a **concise OpenAPI 3.1 file** (paths, schemas, headers, errors) so you can generate SDKs and wire it into a docs viewer.
+
